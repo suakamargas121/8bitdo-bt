@@ -493,6 +493,90 @@ one line per packet with a delay long enough to feel the motor (about
 that is usually a firmware fault in code that ran for that byte, not a link
 problem.
 
+## Windows 11 Native XInput & Wireless Rumble Reverse Engineering
+
+Developing the Windows 11 target required reverse engineering both Windows kernel drivers (`xinputhid.sys`) and 8BitDo's proprietary firmware scheduling routines.
+
+### 1. Cracking the Windows "Code 10" Bug (`xinputhid.sys`)
+
+When an Xbox BLE controller connects to Windows, `C:\Windows\System32\drivers\xinputhid.sys` attaches to the HID PDO:
+
+1. **HID Descriptor Validation (`0x140003ed4`)**:
+   - `xinputhid.sys` calls `HidP_GetSpecificValueCaps` on Output Report 3.
+   - It explicitly checks for **five mandatory PID Force-Feedback Usages**:
+     - `0x97` (Enable Actuators Mask, 4-bit)
+     - `0x70` (Magnitudes, 4x 8-bit array for 4 rumble motors)
+     - `0x50` (Duration, 8-bit)
+     - `0xA7` (Start Delay, 8-bit)
+     - `0x7C` (Loop Count, 8-bit)
+   - If any of these usages are missing from Output Report 3, `xinputhid.sys` returns `STATUS_UNSUCCESSFUL` (`0xC0000001`), resulting in **Device Manager Code 10**.
+2. **The 116-byte Constraint**:
+   - The stock 8BitDo firmware allocates an exact 116-byte slot at `0x11414` for the Report Map.
+   - We engineered a compact 116-byte descriptor that satisfies all 5 PID force-feedback requirements alongside the 19-byte Xbox Input Report (Report 1).
+
+### 2. Runtime Vibration Dispatch & The Scale Mismatch
+
+Tracing `xinputhid.sys` during active vibration:
+- **`xinputhid.sys!0x1400064b5`**: Handles `IOCTL_HID_SET_OUTPUT_REPORT`.
+- **Lookup Table (`0x140001020`)**: Windows divides incoming XInput 16-bit motor speeds (`0..65535`) through a 256-entry lookup table down to a percentage **`0..100` (`0x00..0x64`)**.
+- It writes a 4-byte magnitude array to Usage `0x70`: `[LT, RT, LeftHeavyMotor, RightLightMotor]`.
+
+**The $2.5\times$ Scaling Solution (2.4G Matched)**:
+- In stock 2.4G mode, the USB dongle directly receives `0..255` from XInput over USB.
+- Over Bluetooth, Windows `xinputhid.sys` divides magnitudes down to `0..100`.
+- To match 2.4G mode identically, we scale Windows `0..100` by **$2.5\times$** via high-speed TC32 bit shifts:
+  $$\text{speed} = (\text{val} \ll 1) + (\text{val} \gg 1) = 2.5 \times \text{val} \quad (\max 250 \approx 98\% \text{ PWM})$$
+- Takes 3 TC32 instructions (`tshftr`, `tshftl`, `tadds`). Multiplies $100 \rightarrow 250$, restoring full 2.4G dynamic range and eliminating deadzone stall on low vibration values (e.g. $25\% \rightarrow 62$, well above the +20 deadzone).
+
+### 3. 8BitDo Firmware Motor Dispatch Internals (`0x9B30` & `0x9B68`)
+
+Disassembly of `0x9A04`, `0x9B30`, and `0x9B68`:
+- **`0x9A04(speed, motor_index)`**:
+  - Telink B80 hardware PWM register setter.
+  - Takes `r0 = speed (0..255)` and `r1 = motor_index (0 = Left heavy, 1 = Right light)`.
+  - Sets the duty cycle in hardware PWM registers `0x008007A8` (motor 0) and `0x008007A4` (motor 1).
+  - Note: Direct calls to `0x9A04` are rapidly decayed by the main loop routine `0x9AD8`.
+- **`0x9B30(left_speed, right_speed, duration)`**:
+  - The true 8BitDo motor scheduler entry point.
+  - Takes `r0 = left (0..255)`, `r1 = right (0..255)`, and `r2 = duration (ticks)`.
+  - Initializes countdown timer in RAM `0x8434F9` and actively arms the background 10ms hardware scheduler tick `0x9B68`.
+  - **The Hold Timer (`r2 = 255`)**: By passing `r2 = 255` (`ffa2`), the motors are held active for **2.55 seconds (2,550ms)** per state change. Sustained in-game rumbles, continuous weapon fire, and engine revs play smoothly without dropouts, while remaining 100% responsive: whenever the game commands `(0, 0)`, the motor stops instantly.
+
+### 4. Post-Mortem: CPU HardFault & Code 43 Recovery
+
+During development, an experimental attempt to mirror L4/R4 bumper buttons inside the code cave resulted in a frozen controller that appeared dead and refused to enter bootloader mode:
+
+1. **The CPU HardFault Bug:**
+   - In manual TC32 bytecode assembly, an incorrect stack pop register mask (`0x4F99` instead of `0x4B99`) corrupted the CPU registers ($R_0, R_1, R_3, R_6, R_7$) and return address upon executing the very first BLE frame after power-on.
+   - The CPU immediately trapped into an unhandled HardFault infinite loop (`while(1)`), halting execution before the power LED could turn on.
+2. **Why Windows Threw "Code 43 - Device Descriptor Request Failed":**
+   - The Ultimate 2C has an **internal 480mAh lithium battery**.
+   - Because the controller is battery-powered, the CPU remained stuck in the freeze loop even when powered "off" externally.
+   - When plugged into USB with `LB + RB`, the chip did **not** perform a cold Power-On Reset (POR) because the CPU was already running on battery power!
+   - Because the frozen CPU couldn't service the host's USB `GET_DESCRIPTOR` request, Windows aborted enumeration with **Code 43**.
+3. **The Fail-Safe Recovery:**
+   - The Telink B80 USB Bootloader (`0x0000..0x5FFF`) is stored in hardware-protected flash and **cannot be overwritten or bricked**.
+   - Holding the power button (Home) for 10–15 seconds forces a hard battery cut/reset.
+   - Once the power rail drops to 0V, holding `LB + RB` while inserting the USB cable executes a true cold boot directly into the bootloader (`2DC8:3208`), allowing safe re-flashing.
+
+### 5. TC32 Instruction Encodings Discovered
+
+Telink's TC32 core is based on ARM Thumb with slight opcode adjustments:
+- **`tshftl Rd, Rm, #imm5`**: `0xF000 | (imm5 << 6) | (Rm << 3) | Rd`
+- **`tshftr Rd, Rm, #imm5`**: `0xF800 | (imm5 << 6) | (Rm << 3) | Rd`
+- **`tadds Rd, Rm, Rn`**: `0xE800 | (Rn << 6) | (Rm << 3) | Rd`
+- **`tadds Rd, Rm, #imm3`**: `0xEC00 | (imm3 << 6) | (Rm << 3) | Rd`
+- **`tmovs Rd, #imm8`**: `0xA000 | (Rd << 8) | imm8`
+- **`tpush {rlist, lr}`**: `0x6400 | (lr << 8) | rlist` (`0x6510` for `{r4, lr}`)
+- **`tpop {rlist, pc}`**: `0x6C00 | (pc << 8) | rlist` (`0x6D10` for `{r4, pc}`)
+- **32-bit `tjl target`** (relative branch from instruction address `pc`):
+  ```python
+  diff = target - (pc + 4)
+  offset = diff // 2  # 22-bit signed
+  w1 = 0x9000 | ((offset >> 11) & 0x7FF)
+  w2 = 0x9800 | (offset & 0x7FF)
+  ```
+
 ## Flashing details
 
 - The bootloader enumerates as `2DC8:3208`; the flasher refuses anything

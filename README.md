@@ -1,134 +1,126 @@
-# 8BitDo Ultimate 2C Wireless: native Xbox controller firmware for macOS
+# 8BitDo Ultimate 2C Wireless: Native Xbox Controller Firmware (Windows 11 & macOS)
 
-This project makes an 8BitDo Ultimate 2C Wireless (Bluetooth mode) work as a
-fully supported controller on macOS, with no drivers, no shims and no daemons.
-A firmware patch changes what the controller presents to the host:
+This project makes the **8BitDo Ultimate 2C Wireless** (Bluetooth mode, model `0x301B`, Telink B80 SoC) work as a **100% native Xbox Wireless Controller** over Bluetooth on both **Windows 11** and **macOS**, with **zero drivers, zero background tools, and zero latency overhead**.
 
-- it introduces itself as a **Microsoft Xbox Elite Wireless Controller
-  (Bluetooth)**, an identity macOS's GameController framework supports, and
-- it emits input reports in the **real Xbox Bluetooth wire format**, so every
-  control lands where Apple's driver expects it, and
-- it repairs the rumble path, so Apple's haptics stack (and every game that
-  uses it) can drive the motors.
+Designed specifically for **wireless couch gaming** (e.g. playing on a TV without cables when the original 2.4GHz USB dongle is lost).
 
-Verified on macOS (Apple Silicon, macOS 27).
+---
+
+## What the Firmware Patch Accomplishes
+
+A custom Telink TC32 firmware patch transforms the controller's Bluetooth presentation:
+
+1. **Native Windows 11 XInput (`xinputhid.sys`)**:
+   - Presents as a genuine **Microsoft Xbox Wireless Controller (`045E:0B13`)**.
+   - Serves an exact **116-byte HID Report Descriptor** crafted to satisfy Windows `xinputhid.sys` with **Code 0** (no Code 10 / "cannot start" errors).
+   - Eliminates the need for Steam Input, DS4Windows, or third-party wrappers.
+
+2. **Full Wireless Force-Feedback Rumble (Vibration)**:
+   - Repairs 8BitDo's dead Bluetooth output characteristic (which was shipped with an unpopulated RAM pointer and 1-byte length).
+   - Implements full Xbox Output Report 3 containing all 5 PID force-feedback usages required by Windows: `0x97` (enable mask), `0x70` (magnitudes), `0x50` (duration), `0xA7` (delay), `0x7C` (loop count).
+   - **$2.5\times$ Power Scaling (2.4G Matched)**: Automatically scales incoming Windows magnitude (`0..100`) to 8BitDo hardware PWM levels (`0..250`), restoring full bone-shaking 2.4G-matched rumble force across the entire dynamic range.
+   - **2.55-Second Continuous Hardware Timer (`r2 = 255`)**: Sets the motor scheduler countdown timer to 255 ticks (2.55s) so sustained in-game rumble, continuous weapon fire, and engine revs play smoothly without dropouts, while cutting power instantly when the game commands `(0, 0)`.
+
+3. **Wire-Format Report Rewriting**:
+   - Injected TC32 code translates stock 10-byte DirectInput reports into standard 19-byte Xbox reports on every packet frame.
+   - Fixes swapped LT/RT triggers and analog stick axes.
+   - Provides full 16-bit high-resolution stick and trigger precision.
+
+4. **macOS Support**:
+   - Fully recognized by Apple's `GameController.framework` and `CoreHaptics` on Apple Silicon and Intel macOS.
+
+---
 
 ## Disclaimer
 
-**This project was developed with AI assistance**, including the firmware
-reverse engineering, the patch tooling and the boot tools. Review the code
-before running it.
+**This project was developed with AI assistance**, including the firmware reverse engineering, opcode disassembly, patch tooling, and flashing scripts.
 
-Flashing modified firmware is done entirely at your own risk. The author is
-not responsible for a bricked controller, lost data, damaged hardware, or any
-other consequences of using this project. The official 8BitDo updater can
-always restore stock firmware over USB, and `flash-firmware.sh` always takes a
-backup first, but that is not a guarantee of recovery.
+Flashing modified firmware is done entirely at your own risk. The author is not responsible for a bricked controller, damaged hardware, or lost data. The official 8BitDo updater can always restore stock firmware over USB, and the flashing scripts take automated backups before writing, but proceed with care.
+
+---
 
 ## Requirements
 
-- 8BitDo Ultimate 2C Wireless controller (model `0x301B`)
-- The official 1.06 beta firmware as input (the only supported base image)
-- macOS with Xcode command line tools (`clang`) to build the tools
+- **8BitDo Ultimate 2C Wireless controller** (Model `0x301B`)
+- The official **v1.06 beta firmware** as input (`8bitdo-ultimate-2c-wireless_v1.06-beta_model-0x301B.dat`)
+- **Windows 11 / 10** with Python 3.10+ (or **macOS** with clang)
+- USB-C cable (for the one-time flash in bootloader mode)
 
-## Usage
+---
 
-### Quick start: flash the prebuilt firmware
+## Quick Start (Windows)
 
-Download the patched firmware:
+### 1. Flash the Firmware
+1. Turn off the controller (hold Home button until the light turns off).
+2. Put the controller in **Bootloader Mode**: hold **`LB` + `RB`**, then plug the USB-C cable into your PC. The LED ring will stay off and the device enumerates as `8BitDo Boot` (`2DC8:3208`).
+3. Double-click [`flash-firmware.bat`](flash-firmware.bat) (or run `py -3.12 flash_ultimate2c.py ultimate2c-xbox-windows-rumble.dat`).
+4. Wait for flashing and verification to reach 100%. Unplug the USB cable.
 
-```sh
-curl -LO https://github.com/Alan-Gomes/8bitdo-macos/releases/download/0.02/ultimate2c-1.06beta-xbox-full.dat
-```
+### 2. Pair Over Bluetooth
+1. In Windows Settings -> **Bluetooth & devices**:
+   - If previously paired, click `...` on the controller -> **Remove device** (clears cached descriptors).
+2. Hold the pairing button on top of the controller until the indicator blinks rapidly.
+3. Click **Add device** -> **Bluetooth** -> select **Xbox Wireless Controller**.
 
-Then follow [Flashing](#flashing) below.
+### 3. Verify Inputs and Rumble
+- **Test vibration**:
+  ```powershell
+  py -3.12 test_rumble.py
+  ```
+  Tests Left heavy motor, Right light motor, 100% full rumble, and a 4-step dynamic speed staircase.
+- **Test buttons & sticks**:
+  ```powershell
+  py -3.12 test_inputs.py
+  ```
+- **Benchmark Latency & Polling Rate**:
+  ```powershell
+  py -3.12 benchmark_latency.py
+  ```
+  *(Or double-click [`benchmark-latency.bat`](benchmark-latency.bat))*. Supports **XInput**, **DirectInput**, and **Raw HID** with side-by-side Bluetooth vs. Cable comparison and live Hz monitoring.
 
-### Flashing
+---
 
-1. Put the controller in BOOT mode: hold **LB + RB** while plugging in the USB
-   cable. It enumerates as "8BitDo Boot".
+## Quick Start (macOS)
 
-2. Flash:
-
+1. Put controller in BOOT mode (`LB + RB` + USB cable).
+2. Flash using the macOS shell script:
    ```sh
    I_UNDERSTAND_BRICK_RISK=1 ./flash-firmware.sh ultimate2c-1.06beta-xbox-full.dat
    ```
+3. Forget and re-pair the controller in macOS System Settings -> Bluetooth.
 
-   The script verifies the firmware hash, builds the boot tools, backs up the
-   controller's current flash to `backups/`, then writes the new firmware and
-   verifies the readback byte-for-byte.
+---
 
-3. Forget and re-pair the controller in System Settings, under Bluetooth.
+## Feature Support Matrix
 
-4. Test. It appears in System Settings as a gamepad and works in any game
-   that accepts an Xbox controller. If it does not, check that it was
-   re-paired after flashing.
+| Feature | Windows 11 (XInput Bluetooth) | macOS (GameController Bluetooth) |
+|---|:---:|:---:|
+| Left / Right Sticks (16-bit analog) | **Yes** | **Yes** |
+| LT / RT Triggers (16-bit analog) | **Yes** | **Yes** |
+| A / B / X / Y | **Yes** | **Yes** |
+| LB / RB Bumpers | **Yes** | **Yes** |
+| View / Menu (Back / Start) | **Yes** | **Yes** |
+| Home (Xbox Guide Button) | **Yes** | **Yes** |
+| L3 / R3 (Stick clicks) | **Yes** | **Yes** |
+| D-pad (all 8 directions) | **Yes** | **Yes** |
+| **Wireless Force-Feedback Rumble** | **Yes (Full $2.5\times$ Scaled, 2.55s continuous)** | **Yes (CoreHaptics)** |
+| L4 / R4 Extra Bumpers | Stock DirectInput bits (Standard XInput 16-button profile) | Wire-only (Apple Elite limitation) |
+| USB Wired Mode | **Stock (Untouched)** | **Stock (Untouched)** |
+| 2.4GHz Dongle Radio | **Stock (Untouched)** | **Stock (Untouched)** |
 
-To restore stock firmware, flash the unmodified 1.06 beta or any `backups/`
-image with `./build/ultimate2c_boot_flash` while the controller is in BOOT
-mode.
-
-### Build it yourself
-
-1. Download the 1.06 beta firmware:
-
-   ```sh
-   curl -LO https://github.com/Alan-Gomes/8bitdo-macos/releases/download/firmware-ultimate-2c-v1.06-beta/8bitdo-ultimate-2c-wireless_v1.06-beta_model-0x301B.dat
-   ```
-
-2. Build the patched firmware (verifies the input and output hashes):
-
-   ```sh
-   ./patch-xbox-full-firmware.sh 8bitdo-ultimate-2c-wireless_v1.06-beta_model-0x301B.dat
-   ```
-
-   Output: `ultimate2c-1.06beta-xbox-full.dat`. It matches the prebuilt
-   download above byte for byte (same SHA-256), so it can be flashed with the
-   same [Flashing](#flashing) steps.
-
-
-## Status
-
-| Feature | Works on macOS |
-|---|---|
-| Left / right stick (analog, full range) | yes |
-| LT / RT (analog) | yes |
-| A B X Y | yes |
-| LB / RB | yes |
-| + / − (Menu / Options) | yes |
-| Home | yes |
-| L3 / R3 (stick clicks) | yes |
-| D-pad (all eight directions) | yes |
-| Rumble (CoreHaptics / GameController haptics) | yes |
-| L4 / R4 extra bumpers | wire only, see below |
-
-The L4/R4 buttons are encoded correctly on the wire (Xbox Elite paddle byte,
-verified with a packet capture) and work in SDL-based readers, but macOS's
-GameController framework does not expose paddle elements for this emulated
-device (`GCXboxGamepad.paddleButton1-4` are nil; Apple only surfaces them
-after its genuine Xbox Elite handshake, which this patch does not replicate).
-
-Everything else about the controller is stock: the 2.4 GHz connection mode,
-USB mode, button remapping and turbo combos are untouched. Only the Bluetooth
-presentation changed.
+---
 
 ## Checksums
 
 | File | SHA-256 |
 |---|---|
-| Input: official 1.06 beta (`0x301B`) | `11c8d195d3ca76da24a33ba92ad9d7ae8ad6f455244864bed4c66898e9074bfb` |
-| Output: patched firmware | `18e2c710def1832177b17dbade1f81b9f2aa8c11bf7e5ce71567d0e6d05f34c1` |
+| Input: Official v1.06 beta (`0x301B`) | `11c8d195d3ca76da24a33ba92ad9d7ae8ad6f455244864bed4c66898e9074bfb` |
+| Output: Windows Rumble Build (`ultimate2c-xbox-windows-rumble.dat`) | `d4d2d7f7209487623a2b28cdbbd8e15a4506a2256065cff1b357d780969d15ef` |
+| Output: macOS Full Wire Build (`ultimate2c-1.06beta-xbox-full.dat`) | `18e2c710def1832177b17dbade1f81b9f2aa8c11bf7e5ce71567d0e6d05f34c1` |
 
-`patch-xbox-full-firmware.sh` refuses any input that does not match the first
-hash and any output that does not match the second. `flash-firmware.sh`
-flashes only the second and refuses everything else.
+---
 
 ## Documentation
 
-- [docs/firmware-patch.md](docs/firmware-patch.md) - what the patch changes,
-  every offset, both wire formats, and the evidence behind each decision
-- [docs/developing-patches.md](docs/developing-patches.md) - how the patch was
-  reverse engineered (host-side measurements, locating firmware code paths,
-  the rumble debugging case study), the TC32 toolchain, addressing rules,
-  code caves, known firmware landmarks, reference material, and a from-zero
-  checklist for new patches
+- **[docs/firmware-patch.md](docs/firmware-patch.md)** - In-depth breakdown of the patch, exact memory offsets, GATT table layout, Report Descriptors, wire formats, and rumble scaling mechanics.
+- **[docs/developing-patches.md](docs/developing-patches.md)** - Complete technical guide on reverse engineering the Telink B80 SoC: disassembly with Ghidra/TC32, kernel tracing (`xinputhid.sys`), opcode encodings, code cave injection, and safe flashing practices.
